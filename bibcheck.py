@@ -683,9 +683,18 @@ def authors_overlap(input_authors, found_authors):
     return hits
 
 def print_match(input_title, found_title, input_authors, found_authors):
+    # Normalize titles
+    norm_input = set(re.sub(r"[^a-z0-9 ]", " ", input_title.lower()).split())
+    norm_found = set(re.sub(r"[^a-z0-9 ]", " ", found_title.lower()).split())
+    overlap = len(norm_input & norm_found)
+    required = max(3, len(norm_input), len(norm_found))
+
+    # Check if there's reasonable overlap
+    color = GREEN if overlap >= required else RED
+
     # Print titles
-    print(BLUE + "INPUT TITLE: " + RESET + GREEN + (input_title or "N/A") + RESET)
-    print(BLUE + "FOUND TITLE: " + RESET + GREEN + (found_title or "N/A") + RESET)
+    print(BLUE + "INPUT TITLE: " + RESET + color + (input_title or "N/A") + RESET)
+    print(BLUE + "FOUND TITLE: " + RESET + color + (found_title or "N/A") + RESET)
 
     # Normalize author surnames
     norm_in = [a.lower() for a in (input_authors or [])]
@@ -693,7 +702,7 @@ def print_match(input_title, found_title, input_authors, found_authors):
 
     # Check if there's reasonable overlap
     hits = authors_overlap(input_authors, found_authors)
-    required = max(1, len(input_authors)) if input_authors else 1
+    required = max(1, len(input_authors), len(found_authors))
     authors_match = hits >= required and bool(found_authors)
 
     # Pick color
