@@ -15,3 +15,6 @@ For each citation, red output means a match was not found.  All other colors ind
 1. Titles : The input title from the provided citation is first printed, followed by the matched title.  If these are green, the script believes the titles match but please verify.
 2. Authors : The input author(s) are printed next, followed by the matched paper's authors.  If these are cyan, the script believes the authors match, but please verify.  If these are orange, the script is unable to determine that the author's names match, likely due to small discrepencies such as diacritics.
 3. Full input and output : The input information and the matched output are printed last.  A blue color indicates a match, while red indicates no match was found.
+
+## Acknowledgements
+ChatGPT 5 generated large portions of this code.
