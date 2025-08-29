@@ -104,7 +104,6 @@ def fix_pdf_artifacts2(text: str) -> str:
 def extract_text_from_pdf(pdf_path):
     reader = PdfReader(pdf_path)
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    #return fix_pdf_artifacts(text)
     return text
 
 def find_bibliography_section(text):
@@ -305,18 +304,18 @@ def check_doi_link(entry):
 # ---------------------------
 # Crossref + fallback
 # ---------------------------
-def author_overlap(authors, crossref_authors):
-    """Loose surname overlap check (at least one surname matches)."""
-    for a in authors:
-        a = a.lower()
-        for ca in crossref_authors:
-            ca = ca.lower()
-            if a == ca:
-                return True
-            # fuzzy match: first 4 chars overlap
-            if a.startswith(ca[:4]) or ca.startswith(a[:4]):
-                return True
-    return False
+#def author_overlap(authors, crossref_authors):
+#    """Loose surname overlap check (at least one surname matches)."""
+#    for a in authors:
+#        a = a.lower()
+#        for ca in crossref_authors:
+#            ca = ca.lower()
+#            if a == ca:
+#                return True
+#            # fuzzy match: first 4 chars overlap
+#            if a.startswith(ca[:4]) or ca.startswith(a[:4]):
+#                return True
+#    return False
 
 
 def validate_reference(entry):
@@ -335,7 +334,7 @@ def validate_reference(entry):
         return doi_direct
 
     # Step 3: fallback to title-based Crossref lookup
-    crossref_result = check_with_crossref(title)
+    crossref_result = check_with_crossref(title, authors)
     if crossref_result["found"]:
         return crossref_result
     crossref_authors = ""
@@ -345,7 +344,7 @@ def validate_reference(entry):
         crossref_title = crossref_result["title"]
     
     # Step 4: try OpenAlex
-    openalex_result = check_with_openalex(title)
+    openalex_result = check_with_openalex(title, authors)
     if openalex_result["found"]:
         return openalex_result
     openalex_authors = ""
@@ -356,18 +355,13 @@ def validate_reference(entry):
 
     if ":" in title:
         search_title = title.split(":", 1)[0].strip()
-        openalex_result = check_with_openalex(search_title)
+        openalex_result = check_with_openalex(search_title, authors)
         if openalex_result["found"]:
             return openalex_result
 
 
-    # Step 5: try OpenReview
-    openreview_result = check_with_openreview(entry)
-    if openreview_result["found"]:
-        return openreview_result
-
     # Step 6: try arXiv search
-    arxiv_result = check_with_arxiv(title)
+    arxiv_result = check_with_arxiv(title, authors)
     if arxiv_result["found"]:
         return arxiv_result
     arxiv_authors = ""
@@ -378,7 +372,7 @@ def validate_reference(entry):
 
     if ":" in title:
         search_title = title.split(":", 1)[1].strip()
-        arxiv_result = check_with_arxiv(search_title)
+        arxiv_result = check_with_arxiv(search_title, authors)
         if arxiv_result["found"]:
             return arxiv_result
 
@@ -416,7 +410,7 @@ def clean_title_for_openalex(title: str) -> str:
     return title.strip(" .,\n\t\"“”")
 
 
-def check_with_crossref(title):
+def check_with_crossref(title, authors):
     try:
         result = cr.works(query_title=title, limit=3)
         items = result.get("message", {}).get("items", [])
@@ -428,7 +422,7 @@ def check_with_crossref(title):
             crossref_authors = [a.get("family", "").lower() for a in item.get("author", [])]
 
             title_matches = (norm_in_title in norm_cr_title or norm_cr_title in norm_in_title)
-            authors_match = (not authors or author_overlap(authors, crossref_authors))
+            authors_match = authors_overlap(authors, crossref_authors)
 
             if title_matches and authors_match:
                 return {
@@ -458,7 +452,7 @@ def check_with_crossref(title):
             "authors": [a.get("family", "").lower() for a in items[0].get("author", [])]
         }
 
-def check_with_openalex(title):
+def check_with_openalex(title, authors):
     import urllib.parse
     cleaned = clean_title_for_openalex(title)
 
@@ -470,7 +464,25 @@ def check_with_openalex(title):
         data = r.json()
         for item in data.get("results", []):
             oa_title = normalize_text(item.get("title", ""))
-            if oa_title == normalize_text(cleaned):
+            if not oa_title:
+                continue
+
+            def tokens(s):
+                s = unicodedata.normalize("NFKD", s).lower()
+                s = re.sub(r"[-–—]", " ", s)
+                s = re.sub(r"[^a-z0-9 ]", " ", s)
+                return set(s.split())
+
+            input_tokens = tokens(cleaned)
+            found_tokens = tokens(oa_title)
+
+            overlap = len(input_tokens & found_tokens)
+            required = max(1, len(input_tokens) - 1, len(found_tokens) - 1)  # allow 1 word mismatch
+
+            openalex_authors = [a["author"]["display_name"] for a in item.get("authorships", [])]
+            authors_match = authors_overlap(authors, openalex_authors)
+
+            if overlap >= required and authors_match:
                 return {
                     "found": True,
                     "method": "openalex",
@@ -478,8 +490,9 @@ def check_with_openalex(title):
                     "title": item.get("title"),
                     "venue": item.get("host_venue", {}).get("display_name"),
                     "url": item.get("id"),
-                    "authors": [a["author"]["display_name"] for a in item.get("authorships", [])]
+                    "authors": openalex_authors
                 }
+
 
         if len(data.get("results", [])) == 0:
             return {"found": False,
@@ -495,27 +508,6 @@ def check_with_openalex(title):
     return {"found": False,
             "close": False
             }
-
-
-def check_with_openreview(entry):
-    m = re.search(r"(https?://openreview\.net/forum\?id=\s*\S+)", entry)
-    if m:
-        url = m.group(1).replace(" ", "")
-        try:
-            r = requests.head(url, allow_redirects=True, timeout=5)
-            if r.status_code == 200:
-                return {
-                    "found": True,
-                    "method": "openreview",
-                    "doi": None,
-                    "title": None,
-                    "venue": "OpenReview",
-                    "url": url
-                }
-        except Exception:
-            pass
-    return {"found": False}
-
 
 import requests
 import re
@@ -562,9 +554,11 @@ def check_with_googlebooks(title, authors):
             norm_input = set(re.sub(r"[^a-z0-9 ]", " ", title.lower()).split())
             norm_found = set(re.sub(r"[^a-z0-9 ]", " ", full_title.lower()).split())
             overlap = len(norm_input & norm_found)
-            required = max(3, len(norm_input) - 1)
+            required = max(1, len(norm_input) - 1, len(norm_found) - 1)
 
-            if overlap >= required:
+            authors_match = authors_overlap(authors, g_authors)            
+
+            if overlap >= required and authors_match:
                 return {
                     "found": True,
                     "method": "google-books",
@@ -608,7 +602,7 @@ def clean_for_arxiv(title: str) -> str:
     title = re.sub(r"\bIn\s+\d{4}.*", "", title, maxsplit=1, flags=re.I)
     return title.strip(" .,")
 
-def check_with_arxiv(title):
+def check_with_arxiv(title, authors):
     max_overlap = 0
     max_entry = ""
     max_title = ""
@@ -633,9 +627,12 @@ def check_with_arxiv(title):
 
             # Word overlap (lenient but meaningful)
             overlap = len(set(cited_title.split()) & set(arxiv_title.split()))
-            required = max(3, len(cited_title.split()) - 1 )  # ~1/3 words must match
+            required = max(1, len(cited_title.split()) - 1, len(arxive_title.split()) - 1)  # ~1/3 words must match
 
-            if overlap >= required:
+            arxiv_authors = [a.name for a in entry.get("authors", [])]
+            authors_match = authors_overlap(authors, arxiv_authors)
+
+            if overlap >= required and authors_match:
                 return {
                     "found": True,
                     "method": "arxiv",
@@ -643,13 +640,14 @@ def check_with_arxiv(title):
                     "title": entry.get("title"),
                     "venue": "arXiv",
                     "url": entry.get("id"),
-                    "authors": [a.name for a in entry.get("authors", [])]
+                    "authors": arxiv_authors
                 }
             elif overlap > max_overlap:
                 max_overlap = overlap
                 max_entry = entry
                 max_title = entry.get("title")
-                max_authors = [a.name for a in entry.get("authors", [])]
+                max_authors = arxiv_authors
+
     except Exception:
         pass
 
@@ -687,7 +685,7 @@ def print_match(input_title, found_title, input_authors, found_authors):
     norm_input = set(re.sub(r"[^a-z0-9 ]", " ", input_title.lower()).split())
     norm_found = set(re.sub(r"[^a-z0-9 ]", " ", found_title.lower()).split())
     overlap = len(norm_input & norm_found)
-    required = max(3, len(norm_input), len(norm_found))
+    required = max(1, len(norm_input), len(norm_found))
 
     # Check if there's reasonable overlap
     color = GREEN if overlap >= required else RED
@@ -744,12 +742,7 @@ def parse_and_validate(pdf_path, style="ieee"):
 
             print_match(input_title, found_title, input_authors, found_authors)
 
-            if validation["method"] == "title": 
-                color = BLUE
-            elif validation["method"] == "arxiv": 
-                color = MAGENTA 
-            else: 
-                color = BLUE
+            color = BLUE
         else:
             color = RED
 
