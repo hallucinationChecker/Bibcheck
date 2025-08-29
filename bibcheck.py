@@ -8,6 +8,8 @@ from habanero import Crossref
 import feedparser
 import requests
 import string
+import unicodedata
+
 
 # ANSI Colors
 GREEN = "\033[92m"  # matched titles
@@ -134,11 +136,30 @@ def parse_ieee(bib_text):
 def normalize_text(s):
     if not s:
         return ""
-    return unicodedata.normalize("NFKD", str(s)).lower().strip()
+    s = unicodedata.normalize("NFKD", s)
+    # Replace all dash-like characters with ASCII "-"
+    s = re.sub(r"[‐-‒–—−]", "-", s)  # covers U+2010..U+2212
+    return s.lower().strip()
 
+
+def extract_authors(author_block):
+    authors = []
+    # Normalize weird PDF encodings
+    author_block = unicodedata.normalize("NFKC", author_block)
+
+    raw_authors = re.split(r",| and ", author_block)
+    for a in raw_authors:
+        a = a.strip()
+        if not a:
+            continue
+        surname = a.split()[-1].strip(string.punctuation)
+
+        # Keep accented names too
+        if surname and (surname[0].isupper() or surname[0].isalpha()):
+            authors.append(surname)
+    return authors
 
 def extract_fields(entry):
-    authors = []
     title = ""
 
     # IEEE style (quoted title)
@@ -162,14 +183,10 @@ def extract_fields(entry):
             author_block, title = entry, ""
 
     # --- Authors ---
-    raw_authors = [a.strip() for a in author_block.split(",") if a.strip()]
-    for a in raw_authors:
-        surname = a.split()[-1].strip(string.punctuation)
-        if surname.istitle() and len(surname) > 1:
-            authors.append(surname)
+    authors = extract_authors(author_block)
+
 
     # --- Clean title ---
-    #title = re.sub(r"(Springer|Pearson|Elsevier|Wiley|SIAM|PMLR|ACM|IEEE).*", "", title, flags=re.I)
     # Cut off publisher phrases after a period
     title = re.split(
         r"\.\s*(?:In\b|CoRR\b|arXiv\b|arxiv preprint|corr abs/|doi:|https?://|Springer|CRC Press|Wiley|Pearson|Elsevier)",
@@ -226,7 +243,7 @@ def check_arxiv_link(entry, force_id=None):
         cited_tokens = set(re.sub(r"[^a-z0-9 ]", " ", norm_cited_title).split())
         arxiv_tokens = set(re.sub(r"[^a-z0-9 ]", " ", norm_arxiv_title).split())
         overlap = len(cited_tokens & arxiv_tokens)
-        required = max(3, len(cited_tokens) // 2)
+        required = max(3, len(cited_tokens) -1 )
 
         if overlap >= required:
             return {
@@ -302,8 +319,10 @@ def author_overlap(authors, crossref_authors):
     return False
 
 
-def check_with_crossref(entry):
+def validate_reference(entry):
     """Main validation pipeline with arXiv/DOI priority."""
+
+    title, authors, venue = extract_fields(entry)
 
     # Step 1: direct arXiv link check
     arxiv_direct = check_arxiv_link(entry)
@@ -316,35 +335,24 @@ def check_with_crossref(entry):
         return doi_direct
 
     # Step 3: fallback to title-based Crossref lookup
-    title, authors, venue = extract_fields(entry)
-    try:
-        result = cr.works(query_title=title, limit=3)
-        items = result.get("message", {}).get("items", [])
-        for item in items:
-            crossref_title = item.get("title", [""])[0]
-            norm_in_title = normalize_text(title)
-            norm_cr_title = normalize_text(crossref_title)
-
-            crossref_authors = [a.get("family", "").lower() for a in item.get("author", [])]
-
-            title_matches = (norm_in_title in norm_cr_title or norm_cr_title in norm_in_title)
-            authors_match = (not authors or author_overlap(authors, crossref_authors))
-
-            if title_matches and authors_match:
-                return {
-                    "found": True,
-                    "method": "title+author",
-                    "doi": item.get("DOI"),
-                    "title": crossref_title,
-                    "venue": item.get("container-title", [""])[0] if item.get("container-title") else ""
-                }
-    except Exception:
-        pass
-
+    crossref_result = check_with_crossref(title)
+    if crossref_result["found"]:
+        return crossref_result
+    crossref_authors = ""
+    crossref_title = ""
+    if crossref_result["close"]:
+        crossref_authors = crossref_result["authors"]
+        crossref_title = crossref_result["title"]
+    
     # Step 4: try OpenAlex
     openalex_result = check_with_openalex(title)
     if openalex_result["found"]:
         return openalex_result
+    openalex_authors = ""
+    openalex_title = ""
+    if openalex_result["close"]:
+        openalex_authors = openalex_result["authors"]
+        openalex_title = openalex_result["title"]
 
     if ":" in title:
         search_title = title.split(":", 1)[0].strip()
@@ -362,6 +370,11 @@ def check_with_crossref(entry):
     arxiv_result = check_with_arxiv(title)
     if arxiv_result["found"]:
         return arxiv_result
+    arxiv_authors = ""
+    arxiv_title = ""
+    if arxiv_result["close"]:
+        arxiv_authors = arxiv_result["authors"]
+        arxiv_title = arxiv_result["title"]
 
     if ":" in title:
         search_title = title.split(":", 1)[1].strip()
@@ -373,10 +386,24 @@ def check_with_crossref(entry):
     googlebooks_result = check_with_googlebooks(title, authors)
     if googlebooks_result["found"]:
         return googlebooks_result
+    googlebooks_authors = ""
+    googlebooks_title = ""
+    if googlebooks_result["close"]:
+        googlebooks_authors = googlebooks_result["authors"]
+        googlebooks_title = googlebooks_result["title"]
 
 
-    return {"found": False}
-
+    return {
+            "found": False,
+            "crossref_title": crossref_title,
+            "crossref_authors": crossref_authors,
+            "openalex_title": openalex_title,
+            "openalex_authors": openalex_authors,
+            "arxiv_title": arxiv_title,
+            "arxiv_authors": arxiv_authors,
+            "googlebooks_title": googlebooks_title,
+            "googlebooks_authors": googlebooks_authors
+        }
 
 def clean_title_for_openalex(title: str) -> str:
     # Match ACM (. In …) or IEEE (,” in … or , Journal … etc.)
@@ -388,6 +415,48 @@ def clean_title_for_openalex(title: str) -> str:
     )[0]
     return title.strip(" .,\n\t\"“”")
 
+
+def check_with_crossref(title):
+    try:
+        result = cr.works(query_title=title, limit=3)
+        items = result.get("message", {}).get("items", [])
+        for item in items:
+            crossref_title = item.get("title", [""])[0]
+            norm_in_title = normalize_text(title)
+            norm_cr_title = normalize_text(crossref_title)
+
+            crossref_authors = [a.get("family", "").lower() for a in item.get("author", [])]
+
+            title_matches = (norm_in_title in norm_cr_title or norm_cr_title in norm_in_title)
+            authors_match = (not authors or author_overlap(authors, crossref_authors))
+
+            if title_matches and authors_match:
+                return {
+                    "found": True,
+                    "method": "crossref",
+                    "doi": item.get("DOI"),
+                    "title": crossref_title,
+                    "authors": crossref_authors,
+                    "venue": item.get("container-title", [""])[0] if item.get("container-title") else ""
+                }
+
+        if (len(items) == 0):
+            return {
+                "found": False,
+                "close": False
+            }
+
+    except Exception:
+        return {"found": False,
+                "close": False
+                }
+
+    return {
+            "found": False,
+            "close": True,            
+            "title": items[0].get("title", [""])[0],
+            "authors": [a.get("family", "").lower() for a in items[0].get("author", [])]
+        }
 
 def check_with_openalex(title):
     import urllib.parse
@@ -411,7 +480,22 @@ def check_with_openalex(title):
                     "url": item.get("id"),
                     "authors": [a["author"]["display_name"] for a in item.get("authorships", [])]
                 }
-    return {"found": False}
+
+        if len(data.get("results", [])) == 0:
+            return {"found": False,
+                    "close": False
+                    }
+        else:
+            return {
+                    "found": False,
+                    "close": True,            
+                    "title": data.get("results", [])[0].get("title"),
+                    "authors": [a["author"]["display_name"] for a in (data.get("results", [])[0]).get("authorships", [])]
+            }
+    return {"found": False,
+            "close": False
+            }
+
 
 def check_with_openreview(entry):
     m = re.search(r"(https?://openreview\.net/forum\?id=\s*\S+)", entry)
@@ -441,6 +525,10 @@ def check_with_googlebooks(title, authors):
     Try to find a match on Google Books.
     - Handles cases where article/chapter titles show up in subtitle or textSnippet.
     """
+    max_overlap = 0
+    max_item = ""
+    max_title = ""
+    max_authors = ""
     try:
         query = f"intitle:{title}"
         url = f"https://www.googleapis.com/books/v1/volumes?q={query}"
@@ -474,7 +562,7 @@ def check_with_googlebooks(title, authors):
             norm_input = set(re.sub(r"[^a-z0-9 ]", " ", title.lower()).split())
             norm_found = set(re.sub(r"[^a-z0-9 ]", " ", full_title.lower()).split())
             overlap = len(norm_input & norm_found)
-            required = max(3, len(norm_input) // 2)
+            required = max(3, len(norm_input) - 1)
 
             if overlap >= required:
                 return {
@@ -487,11 +575,26 @@ def check_with_googlebooks(title, authors):
                     "authors": g_authors,
                     "published": published_date,
                 }
+            elif overlap > max_overlap:
+                max_overlap = overlap
+                max_item = item
+                max_title = full_title
+                max_authors = g_authors
 
     except Exception as e:
         print("Google Books error:", e)
 
-    return {"found": False}
+    if max_item != "":
+        return {
+            "found": False,
+            "close": True,            
+            "title": max_title,
+            "authors": max_authors,
+        }
+    else:
+        return {"found": False,
+                "close": False
+                }
 
 
 
@@ -506,6 +609,10 @@ def clean_for_arxiv(title: str) -> str:
     return title.strip(" .,")
 
 def check_with_arxiv(title):
+    max_overlap = 0
+    max_entry = ""
+    max_title = ""
+    max_authors = ""
     try:
         clean_title = clean_for_arxiv(title)
 
@@ -526,7 +633,7 @@ def check_with_arxiv(title):
 
             # Word overlap (lenient but meaningful)
             overlap = len(set(cited_title.split()) & set(arxiv_title.split()))
-            required = max(3, len(cited_title.split()) // 3)  # ~1/3 words must match
+            required = max(3, len(cited_title.split()) - 1 )  # ~1/3 words must match
 
             if overlap >= required:
                 return {
@@ -538,14 +645,64 @@ def check_with_arxiv(title):
                     "url": entry.get("id"),
                     "authors": [a.name for a in entry.get("authors", [])]
                 }
+            elif overlap > max_overlap:
+                max_overlap = overlap
+                max_entry = entry
+                max_title = entry.get("title")
+                max_authors = [a.name for a in entry.get("authors", [])]
     except Exception:
         pass
-    return {"found": False}
+
+    if (max_entry != ""):
+        return {
+            "found": False,
+            "close": True,            
+            "title": max_title,
+            "authors": max_authors
+            }
+
+    else:
+        return {"found": False,
+                "close": False
+                }
 
 
 # ---------------------------
 # Main Logic
 # ---------------------------
+def authors_overlap(input_authors, found_authors):
+    norm_in = [a.lower() for a in (input_authors or [])]
+    norm_found = [a.lower() for a in (found_authors or [])]
+
+    hits = 0
+    for a in norm_in:
+        for f in norm_found:
+            if a in f or f in a:  # substring match
+                hits += 1
+                break
+    return hits
+
+def print_match(input_title, found_title, input_authors, found_authors):
+    # Print titles
+    print(BLUE + "INPUT TITLE: " + RESET + GREEN + (input_title or "N/A") + RESET)
+    print(BLUE + "FOUND TITLE: " + RESET + GREEN + (found_title or "N/A") + RESET)
+
+    # Normalize author surnames
+    norm_in = [a.lower() for a in (input_authors or [])]
+    norm_found = [a.lower() for a in (found_authors or [])]
+
+    # Check if there's reasonable overlap
+    hits = authors_overlap(input_authors, found_authors)
+    required = max(1, len(input_authors)) if input_authors else 1
+    authors_match = hits >= required and bool(found_authors)
+
+    # Pick color
+    color = GREEN if authors_match else RED
+
+    print(BLUE + "INPUT AUTHORS: " + RESET + color + ", ".join(input_authors or ["N/A"]) + RESET)
+    print(BLUE + "FOUND AUTHORS: " + RESET + color + ", ".join(found_authors or ["N/A"]) + RESET)
+    print()  # blank line
+
 def parse_and_validate(pdf_path, style="ieee"):
     text = extract_text_from_pdf(pdf_path)
     bib_text = find_bibliography_section(text)
@@ -559,26 +716,31 @@ def parse_and_validate(pdf_path, style="ieee"):
         entry1["raw"] = fix_pdf_artifacts1(entry["raw"])
 
         # First attempt
-        result = {"input": entry1["raw"], "crossref": check_with_crossref(entry1["raw"])}
+        result = {"input": entry1["raw"], "validation": validate_reference(entry1["raw"])}
         results.append(result)
-        crossref = result["crossref"]
+        validation = result["validation"]
 
-        if not crossref.get("found"):
+        if not validation.get("found"):
             # Retry with more aggressive PDF fixes
             entry1["raw"] = fix_pdf_artifacts2(entry["raw"])
-            result = {"input": entry1["raw"], "crossref": check_with_crossref(entry1["raw"])}
+            result = {"input": entry1["raw"], "validation": validate_reference(entry1["raw"])}
             results.append(result)
-            crossref = result["crossref"]
+            validation = result["validation"]
 
         # Print matched titles in green, everything else in blue
-        if crossref.get("found"):
-            input_title, _, _ = extract_fields(entry1["raw"])
-            found_title = crossref.get("title", "")
+        if validation.get("found"):
+            input_title, input_authors, _ = extract_fields(entry1["raw"])
+            found_title = validation.get("title")
+            found_authors = validation.get("authors", [])
 
-            print(f"\n{GREEN}INPUT TITLE: {input_title}{RESET}")
-            print(f"{GREEN}FOUND TITLE: {found_title}{RESET}\n")
+            print_match(input_title, found_title, input_authors, found_authors)
 
-            color = BLUE  # all other JSON output is blue
+            if validation["method"] == "title": 
+                color = BLUE
+            elif validation["method"] == "arxiv": 
+                color = MAGENTA 
+            else: 
+                color = BLUE
         else:
             color = RED
 
